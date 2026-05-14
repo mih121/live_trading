@@ -1,0 +1,285 @@
+import time
+from pathlib import Path
+
+import pandas as pd
+import MetaTrader5 as mt5
+
+# py mt5_live_candles.py
+
+SYMBOL = "EURUSD"
+
+BASE_DIR = Path(__file__).resolve().parent
+CANDLE_DIR = BASE_DIR / "live_candles"
+CANDLE_DIR.mkdir(exist_ok=True)
+
+TF_SECONDS = {
+    "M1": 60,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "D1": 86400,
+}
+
+TIMEFRAMES = {
+    "M1": mt5.TIMEFRAME_M1,
+    "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30,
+    "H1": mt5.TIMEFRAME_H1,
+    "H4": mt5.TIMEFRAME_H4,
+    "D1": mt5.TIMEFRAME_D1,
+}
+
+# How much history to download when script starts
+HISTORY_BARS = {
+    "M1": 5000,
+    "M15": 2000,
+    "M30": 1500,
+    "H1": 1000,
+    "H4": 500,
+    "D1": 300,
+}
+
+
+def connect_mt5():
+    if not mt5.initialize():
+        print("MT5 initialize failed:", mt5.last_error())
+        quit()
+
+    account = mt5.account_info()
+    terminal = mt5.terminal_info()
+
+    if account is None:
+        print("Account info failed:", mt5.last_error())
+        mt5.shutdown()
+        quit()
+
+    print("CONNECTED")
+    print("Login:", account.login)
+    print("Server:", account.server)
+    print("Balance:", account.balance)
+    print("Equity:", account.equity)
+    print("Trade allowed:", terminal.trade_allowed)
+
+
+def select_symbol(symbol):
+    if not mt5.symbol_select(symbol, True):
+        print(f"Could not select {symbol}")
+        print("Error:", mt5.last_error())
+        mt5.shutdown()
+        quit()
+
+    print(f"Symbol selected: {symbol}")
+
+
+def csv_path(symbol, tf_name):
+    return CANDLE_DIR / f"{symbol}_{tf_name}.csv"
+
+
+def rates_to_df(rates):
+    df = pd.DataFrame(rates)
+
+    if df.empty:
+        return df
+
+    df["Datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+    df = df.rename(columns={
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "tick_volume": "Volume",
+    })
+
+    df = df[["Datetime", "Open", "High", "Low", "Close", "Volume"]]
+    df = df.sort_values("Datetime").reset_index(drop=True)
+
+    return df
+
+
+def format_datetime_for_csv(df):
+    df = df.copy()
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+    df["Datetime"] = df["Datetime"].dt.strftime("%Y-%m-%d %H:%M:%S+0000")
+    return df
+
+
+def load_existing_csv(path):
+    if not path.exists():
+        return pd.DataFrame(columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+
+    df = pd.read_csv(path)
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+    return df
+
+
+def save_full_csv(path, df):
+    df = df.copy()
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True)
+
+    df = df.drop_duplicates(subset=["Datetime"], keep="last")
+    df = df.sort_values("Datetime").reset_index(drop=True)
+
+    df_csv = format_datetime_for_csv(df)
+    df_csv.to_csv(path, index=False)
+
+
+def warmup_history(symbol):
+    print("\nDownloading startup history...")
+
+    for tf_name, tf_value in TIMEFRAMES.items():
+        count = HISTORY_BARS[tf_name]
+        rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, count)
+
+        if rates is None:
+            print(f"{tf_name} history failed:", mt5.last_error())
+            continue
+
+        df_new = rates_to_df(rates)
+
+        # remove current forming candle, keep only closed candles
+        if len(df_new) > 1:
+            df_new = df_new.iloc[:-1]
+
+        path = csv_path(symbol, tf_name)
+        df_old = load_existing_csv(path)
+
+        combined = pd.concat([df_old, df_new], ignore_index=True)
+        save_full_csv(path, combined)
+
+        print(f"{tf_name}: saved {len(combined)} candles -> {path}")
+
+
+def get_last_closed_candle(symbol, tf_value, tf_seconds):
+    rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, 10)
+
+    if rates is None:
+        print("copy_rates_from_pos failed:", mt5.last_error())
+        return None
+
+    df = rates_to_df(rates)
+
+    if df is None or df.empty:
+        return None
+
+    df = df.sort_values("Datetime").reset_index(drop=True)
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        print("Tick failed:", mt5.last_error())
+        return None
+
+    # MT5 tick time = broker/server time
+    broker_now = pd.to_datetime(tick.time, unit="s", utc=True)
+
+    # candle close time = candle open time + TF duration
+    df["CloseTime"] = df["Datetime"] + pd.to_timedelta(tf_seconds, unit="s")
+
+    # Safety buffer: only accept candle after it has been closed for at least 2 seconds
+    closed = df[df["CloseTime"] <= broker_now - pd.Timedelta(seconds=2)]
+
+    if closed.empty:
+        return None
+
+    # latest confirmed closed candle
+    return closed.iloc[-1]
+
+
+def append_candle(symbol, tf_name, candle):
+    path = csv_path(symbol, tf_name)
+
+    df_old = load_existing_csv(path)
+
+    candle_df = pd.DataFrame([{
+        "Datetime": candle["Datetime"],
+        "Open": candle["Open"],
+        "High": candle["High"],
+        "Low": candle["Low"],
+        "Close": candle["Close"],
+        "Volume": candle["Volume"],
+    }])
+
+    combined = pd.concat([df_old, candle_df], ignore_index=True)
+    before = len(df_old)
+
+    save_full_csv(path, combined)
+
+    after_df = load_existing_csv(path)
+    after = len(after_df)
+
+    return after > before
+
+
+def main():
+    connect_mt5()
+    select_symbol(SYMBOL)
+
+    warmup_history(SYMBOL)
+
+    last_seen = {}
+
+    print("\nSaving new closed candles live...\n")
+
+    while True:
+        try:
+            for tf_name, tf_value in TIMEFRAMES.items():
+                candle = get_last_closed_candle(SYMBOL, tf_value, TF_SECONDS[tf_name])
+
+                if candle is None:
+                    continue
+
+                candle_time = candle["Datetime"]
+
+                if tf_name not in last_seen:
+                    last_seen[tf_name] = candle_time
+                    continue
+
+                if candle_time != last_seen[tf_name]:
+                    last_seen[tf_name] = candle_time
+
+                    saved = append_candle(SYMBOL, tf_name, candle)
+
+                    if saved:
+                        print(
+                            f"NEW {tf_name} saved | {candle_time} | "
+                            f"O={candle['Open']} H={candle['High']} "
+                            f"L={candle['Low']} C={candle['Close']} "
+                            f"Vol={candle['Volume']}"
+                        )
+
+                        # Later call your liquidity logic here:
+                        # run_liquidity_analysis(tf_name)
+
+            time.sleep(1)
+
+        except KeyboardInterrupt:
+            print("Stopped.")
+            break
+
+        except Exception as e:
+            print("Error:", e)
+            time.sleep(5)
+
+    mt5.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
+
+"""
+import pandas as pd
+
+df_m1 = pd.read_csv("live_candles/EURUSD_M1.csv")
+df_m15 = pd.read_csv("live_candles/EURUSD_M15.csv")
+df_m30 = pd.read_csv("live_candles/EURUSD_M30.csv")
+df_h1 = pd.read_csv("live_candles/EURUSD_H1.csv")
+df_h4 = pd.read_csv("live_candles/EURUSD_H4.csv")
+
+df_m1["Datetime"] = pd.to_datetime(df_m1["Datetime"], utc=True)
+df_m15["Datetime"] = pd.to_datetime(df_m15["Datetime"], utc=True)
+df_m30["Datetime"] = pd.to_datetime(df_m30["Datetime"], utc=True)
+df_h1["Datetime"] = pd.to_datetime(df_h1["Datetime"], utc=True)
+df_h4["Datetime"] = pd.to_datetime(df_h4["Datetime"], utc=True)
+"""
