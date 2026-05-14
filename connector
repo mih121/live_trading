@@ -1,0 +1,36 @@
+# aaa
+# py mt5_connector_test.py
+
+import MetaTrader5 as mt5
+import pandas as pd
+from datetime import datetime
+
+LOGIN = xxx
+PASSWORD = "yyy"
+SERVER = "zzz"
+
+
+# Optional: use exact terminal path if automatic connection fails
+MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+
+import MetaTrader5 as mt5
+
+if not mt5.initialize():
+    print("MT5 initialize failed:", mt5.last_error())
+    quit()
+
+account = mt5.account_info()
+
+if account is None:
+    print("Account info failed:", mt5.last_error())
+else:
+    print("CONNECTED")
+    print("Login:", account.login)
+    print("Server:", account.server)
+    print("Balance:", account.balance)
+    print("Equity:", account.equity)
+
+print("Terminal info:", mt5.terminal_info())
+print("MT5 version:", mt5.version())
+
+mt5.shutdown()
